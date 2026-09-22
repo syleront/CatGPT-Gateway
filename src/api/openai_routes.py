@@ -967,7 +967,7 @@ async def create_image(
 
         # Send to ChatGPT
         try:
-            result = await client.send_message(full_prompt)
+            result = await client.send_message(full_prompt, page=page)
         except Exception as e:
             log.error(f"Provider error during image generation: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Provider error: {str(e)}")
