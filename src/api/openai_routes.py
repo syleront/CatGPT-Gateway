@@ -52,6 +52,7 @@ from src.claude.client import ClaudeClient
 from src.minimax.client import MiniMaxClient
 from src.config import Config
 from src.log import setup_logging
+from src.selectors import Selectors
 
 log = setup_logging("openai_routes")
 
@@ -76,6 +77,66 @@ class BrowserPagePool:
 
     def set_browser(self, browser: Any) -> None:
         self._browser = browser
+
+    async def _is_fresh_chat(self, page: Page) -> bool:
+        """Return True when the page shows an empty, brand-new conversation."""
+        try:
+            return bool(
+                await page.evaluate(
+                    """
+                    () => {
+                        const url = location.href || '';
+                        if (url.includes('/c/')) return false;
+                        const turns = document.querySelectorAll(
+                            '[data-testid^="conversation-turn-"]'
+                        );
+                        const composer = document.querySelector(
+                            "#prompt-textarea, div[contenteditable='true']"
+                        );
+                        return turns.length === 0 && !!composer;
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    async def _ensure_fresh_chat(self, page: Page, target_url: str) -> None:
+        """Leave the page on a brand-new, empty conversation before yielding it.
+
+        Verifying the result is essential: the sidebar's ``a[href='/']`` logo
+        link matches the new-chat selector but does nothing, so a blind click
+        used to silently keep the previous conversation (and its history).
+        """
+        current_url = page.url or ""
+
+        # Wrong domain / not loaded yet → hard-navigate to the provider root.
+        if not current_url.startswith(target_url):
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+            return
+
+        if await self._is_fresh_chat(page):
+            return
+
+        # SPA "new chat" button (ordered fallbacks), verified after clicking.
+        for selector in Selectors.NEW_CHAT_BUTTON:
+            try:
+                btn = await page.query_selector(selector)
+                if btn and await btn.is_visible():
+                    await btn.click()
+                    await asyncio.sleep(0.8)
+                    if await self._is_fresh_chat(page):
+                        log.debug(f"Fresh chat via SPA button: {selector}")
+                        return
+            except Exception:
+                continue
+
+        # Fallback: navigating to the provider root always starts a new chat.
+        log.info("SPA new-chat did not take effect — navigating to provider root")
+        try:
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+        except Exception as e:
+            log.debug(f"Fresh-chat navigation failed: {e}")
 
     @asynccontextmanager
     async def acquire_clean_page(self):
@@ -106,23 +167,7 @@ class BrowserPagePool:
                     raise RuntimeError("Browser context unavailable")
 
             # 2. Ensure page is at the provider URL and in a fresh chat state
-            target_url = Config.provider_url()
-            current_url = page.url or ""
-
-            if target_url not in current_url and not current_url.startswith(target_url):
-                await page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
-            else:
-                try:
-                    new_chat_btn = await page.query_selector(
-                        "a[data-testid='create-new-chat-button'], a[href='/']"
-                    )
-                    if new_chat_btn:
-                        await new_chat_btn.click()
-                        await asyncio.sleep(0.3)
-                    elif current_url != f"{target_url}/" and current_url != target_url:
-                        await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
-                except Exception as e:
-                    log.debug(f"Reset to fresh chat exception: {e}")
+            await self._ensure_fresh_chat(page, Config.provider_url())
 
             yield page
 
